@@ -9,7 +9,7 @@ import argparse
 parser = argparse.ArgumentParser(epilog='Press C to capture a set of frames.')
 parser.add_argument('-f', '--fps', type=float, default=30,
                     help='Camera sensor FPS, applied to all cams')
-parser.add_argument('-d', '--draw', default=False, action='store_true',
+parser.add_argument('-d', '--draw', default=True, action='store_true',
                     help='Draw on frames the sequence number and timestamp')
 parser.add_argument('-v', '--verbose', default=0, action='count',
                     help='Verbose, -vv for more verbosity')
@@ -18,17 +18,31 @@ parser.add_argument('-t', '--dev_timestamp', default=False, action='store_true',
 
 args = parser.parse_args()
 
-cam_list = ['left', 'rgb', 'right']
+cam_list = ['right']
 cam_socket_opts = {
-    'rgb'  : dai.CameraBoardSocket.RGB,
-    'left' : dai.CameraBoardSocket.LEFT,
-    'right': dai.CameraBoardSocket.RIGHT,
+    'rgb'   : dai.CameraBoardSocket.RGB,
+    'left'  : dai.CameraBoardSocket.LEFT,
+    'right' : dai.CameraBoardSocket.RIGHT,
+    'depth' : dai.CameraBoardSocket.RIGHT,
 }
-cam_instance = {
-    'rgb'  : 0,
-    'left' : 1,
-    'right': 2,
-}
+
+def make_mono(cam_name, make_xout):
+    global pipeline
+    global cam
+    global xout
+    global cam_socket_opts
+    if not cam_name in cam:
+        cam[cam_name] = pipeline.create(dai.node.MonoCamera)
+        cam[cam_name].setResolution(dai.MonoCameraProperties.SensorResolution.THE_480_P)
+        cam[cam_name].setBoardSocket(cam_socket_opts[cam_name])
+        cam[cam_name].setFps(args.fps)
+    if make_xout and not (cam_name in xout):
+        xout[cam_name] = pipeline.create(dai.node.XLinkOut)
+        xout[cam_name].setStreamName(cam_name)
+        #xout[cam_name].input.setQueueSize(1)
+        #xout[cam_name].input.setBlocking(False)
+    if make_xout:
+        cam[cam_name].out.link(xout[cam_name].input)
 
 # Start defining a pipeline
 pipeline = dai.Pipeline()
@@ -38,18 +52,38 @@ xout = {}
 for c in cam_list:
     xout[c] = pipeline.create(dai.node.XLinkOut)
     xout[c].setStreamName(c)
+    #xout[c].input.setQueueSize(1)
+    #xout[c].input.setBlocking(False)
     if c == 'rgb':
         cam[c] = pipeline.create(dai.node.ColorCamera)
         cam[c].setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
-        cam[c].setIspScale(720, 1080)  # 1920x1080 -> 1280x720
+        cam[c].setIspScale(4, 9)  # downsample 853.3x480
         cam[c].isp.link(xout[c].input)
+        cam[c].setBoardSocket(cam_socket_opts[c])
+        cam[c].setFps(args.fps)
+    elif c == 'depth':
+        make_mono('left', False)
+        make_mono('right', False)
+        cam[c] = pipeline.create(dai.node.StereoDepth)
+        # settings
+        cam[c].useHomographyRectification(False)
+        cam[c].setSubpixel(True)
+        cam[c].setDepthAlign(dai.CameraBoardSocket.RGB)
+        cam[c].setLeftRightCheck(True)
+        cam[c].setOutputSize(832, 480)
+        cam[c].setOutputKeepAspectRatio(True)
+        cam[c].setExtendedDisparity(False)
+        cam[c].setRectifyEdgeFillColor(0)
+        # links
+        cam['left'].out.link(cam[c].left)
+        cam['right'].out.link(cam[c].right)
+        #cam[c].left.setQueueSize(1);  # https://discord.com/channels/790680891252932659/924798503270625290/961835869352886292
+        #cam[c].right.setQueueSize(1)
+        #cam[c].left.setBlocking(False)
+        #cam[c].right.setBlocking(False)
+        cam[c].depth.link(xout[c].input)
     else:
-        cam[c] = pipeline.create(dai.node.MonoCamera)
-        cam[c].setResolution(dai.MonoCameraProperties.SensorResolution.THE_720_P)
-        cam[c].out.link(xout[c].input)
-    cam[c].setBoardSocket(cam_socket_opts[c])
-    cam[c].setFps(args.fps)
-
+        make_mono(c, True)
 
 def get_seq(packet):
     return packet.getSequenceNum()
@@ -61,19 +95,24 @@ def has_keys(obj, keys):
 
 
 class PairingSystem:
-    allowed_instances = [0, 1, 2]  # Center (0) & Left (1) & Right (2)
+    allowed_instances = cam_list
 
     def __init__(self):
         self.seq_packets = {}
         self.last_paired_seq = None
 
-    def add_packet(self, packet):
-        if packet is not None and packet.getInstanceNum() in self.allowed_instances:
+    def add_packet(self, packet, cam_name):
+        if packet is not None and cam_name in self.allowed_instances:
             seq_key = get_seq(packet)
             self.seq_packets[seq_key] = {
                 **self.seq_packets.get(seq_key, {}),
-                packet.getInstanceNum(): packet
+                cam_name: packet
             }
+            #print("added " + cam_name)
+        elif packet is None:
+            pass #print(" empty", end = '')
+        else:
+            pass #print("cant add " + cam_name + " unexpected")
 
     def get_pairs(self):
         results = []
@@ -99,12 +138,12 @@ with dai.Device(pipeline) as device:
 
     q = {}
     for c in cam_list:
-        q[c] = device.getOutputQueue(name=c, maxSize=4, blocking=False)
+        q[c] = device.getOutputQueue(name=c, maxSize=4, blocking=False) # shrink!!
     ps = PairingSystem()
 
     window = ' + '.join(cam_list)
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window, (3*1280//2, 720//2))
+    cv2.resizeWindow(window, (len(cam_list)*640, 480))
 
     if args.verbose > 0:
         print("   Seq  Left_tstamp  RGB-Left  Right-Left  Dropped")
@@ -114,14 +153,23 @@ with dai.Device(pipeline) as device:
     while True:
         # instead of get (blocking) used tryGet (nonblocking) which will return the available data or None otherwise
         for c in cam_list:
-            ps.add_packet(q[c].tryGet())
+            ps.add_packet(q[c].tryGet(), c)
 
         for synced in ps.get_pairs():
             frame, seqnum, tstamp = {}, {}, {}
             for c in cam_list:
-                pkt = synced[cam_instance[c]]
+                pkt = synced[c]
                 frame[c] = pkt.getCvFrame()
-                if c != 'rgb': 
+                if c == 'depth':
+                    d_min = np.min(frame[c])
+                    d_max = 5000 #np.max(frame[c])
+                    frame[c] = (frame[c] - d_min) / (d_max - d_min)
+                    frame[c] = np.array(frame[c]) * 255
+                    frame[c] = frame[c].astype(np.uint8)
+                    frame[c] = cv2.applyColorMap(frame[c], cv2.COLORMAP_BONE)
+                elif c == 'rgb':
+                    pass
+                else:
                     frame[c] = cv2.cvtColor(frame[c], cv2.COLOR_GRAY2BGR)
                 seqnum[c] = pkt.getSequenceNum()
                 if args.dev_timestamp:
@@ -132,7 +180,8 @@ with dai.Device(pipeline) as device:
                     text = '{:1d}'.format(seqnum[c]) + '  {:.6f}'.format(tstamp[c])
                     cv2.putText(frame[c], text, (8,40), cv2.FONT_HERSHEY_DUPLEX, 1.5, (0,0,0), 8, cv2.LINE_AA)
                     cv2.putText(frame[c], text, (8,40), cv2.FONT_HERSHEY_DUPLEX, 1.5, (255,255,255), 2, cv2.LINE_AA)
-            if not(seqnum['rgb'] == seqnum['left'] == seqnum['right']):
+            first_seqnum = list(seqnum.values())[0]
+            if not(all(value == first_seqnum for value in seqnum.values())):
                 print('ERROR: out of sync!!!')
             if args.verbose > 0:
                 seq = seqnum['left']
